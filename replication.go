@@ -172,6 +172,20 @@ func ReplicationConnect(config ConnConfig) (r *ReplicationConn, err error) {
 	return &ReplicationConn{c}, nil
 }
 
+func PhysReplicationConnect(config ConnConfig) (r *ReplicationConn, err error) {
+	if config.RuntimeParams == nil {
+		config.RuntimeParams = make(map[string]string)
+	}
+	config.RuntimeParams["replication"] = "true"
+	config.PreferSimpleProtocol = true
+
+	c, err := connect(config, minimalConnInfo.DeepCopy())
+	if err != nil {
+		return
+	}
+	return &ReplicationConn{c}, nil
+}
+
 // ReplicationConn is a PostgreSQL connection handle established in the
 // replication mode which enables a special set of commands for streaming WAL
 // changes from the server.
@@ -439,9 +453,28 @@ func (rc *ReplicationConn) StartReplication(slotName string, startLsn uint64, ti
 	return
 }
 
+// Sends START_REPLICATION command
+// TODO: check the first message with rc.rxMsg() to make sure that it's CopyBoth
+func (rc *ReplicationConn) StartPhysReplication(slotName string, startLsn uint64, timeline int64) (err error) {
+	queryString := fmt.Sprintf("START_REPLICATION SLOT %s %s", slotName, FormatLSN(startLsn))
+	_, err = rc.Exec(queryString)
+	if err != nil {
+		fmt.Printf("Error to exec Start Replication command: %s", err)
+		return
+	}
+	return nil
+}
+
 // Create the replication slot, using the given name and output plugin.
 func (rc *ReplicationConn) CreateReplicationSlot(slotName, outputPlugin string) (err error) {
 	_, err = rc.Exec(fmt.Sprintf("CREATE_REPLICATION_SLOT %s LOGICAL %s NOEXPORT_SNAPSHOT", slotName, outputPlugin))
+	return
+}
+
+// Create physical replication slot.
+func (rc *ReplicationConn) CreatePhysReplicationSlot(slotName string) (err error) {
+	queryStr := fmt.Sprintf("CREATE_REPLICATION_SLOT %s PHYSICAL", slotName)
+	_, err = rc.Exec(queryStr)
 	return
 }
 

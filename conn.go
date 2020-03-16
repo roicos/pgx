@@ -2199,6 +2199,10 @@ func (c *Conn) execEx(ctx context.Context, sql string, options *QueryExOptions, 
 		}
 
 		switch msg := msg.(type) {
+		case *pgproto3.CopyBothResponse:
+			// This is the tail end of the replication process start,
+			// and can be safely ignored but we have to return here
+			return commandTag, softErr
 		case *pgproto3.ReadyForQuery:
 			c.rxReadyForQuery(msg)
 			return commandTag, softErr
