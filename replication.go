@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"reflect"
 
 	"github.com/pkg/errors"
 
@@ -110,6 +111,14 @@ func (s *ServerHeartbeat) String() string {
 type ReplicationMessage struct {
 	WalMessage      *WalMessage
 	ServerHeartbeat *ServerHeartbeat
+	TimelineSwitch	*TimelineSwitchInfo
+	CopyDone bool
+	CopyBoth bool
+}
+
+type TimelineSwitchInfo struct {
+	NextTimeline string
+	Lsn			 string
 }
 
 // The standby status is the client side heartbeat sent to the postgresql
@@ -252,11 +261,60 @@ func (rc *ReplicationConn) readReplicationMessage() (r *ReplicationMessage, err 
 	case *pgproto3.CopyBothResponse:
 		// This is the tail end of the replication process start,
 		// and can be safely ignored
-		return
+		fmt.Println("CopyBoth message received")
+		return &ReplicationMessage{CopyBoth: true}, nil
+	case *pgproto3.CopyDone:
+		// Done with replicaion on the current timeline
+		buf := rc.wbuf
+		copyDoneMsg := pgproto3.CopyDone{}
+		buf = copyDoneMsg.Encode(buf)
+		fmt.Printf("Sending CopyEnd to server: %T\n", buf)
+		_, err = rc.conn.Write(buf)
+		if err != nil {
+			rc.die(err)
+		}
+		fmt.Println("CopyDone sent")
+		rowDescMsg, err := rc.rxMsg()
+		if err != nil {
+			return nil, err
+		}
+		switch responceMsgType := rowDescMsg.(type) {
+		case *pgproto3.RowDescription:
+			fmt.Println("Timeline switch\n")
+			if len(responceMsgType.Fields) != 2 {
+				return nil, errors.New(fmt.Sprintf("Expected to get 2 fields in row description, got %d", len(responceMsgType.Fields)))
+			}
+			// read for actual timeline switch information
+			dataMsg, err := rc.rxMsg()
+			if err != nil {
+				return nil, err
+			}
+			switch dataMsgType := dataMsg.(type) {
+			case *pgproto3.DataRow:
+				values := dataMsgType.Values
+				if len(values) != 2 {
+					return nil, errors.New(fmt.Sprintf("Expected to get 2 values on timeline switch, got %d", len(values)))
+				}
+				nextTimeline := string(values[0])
+				nextLsn := string(values[1])
+				timelineSwitchInfo := TimelineSwitchInfo{NextTimeline: nextTimeline, Lsn: nextLsn}
+				return &ReplicationMessage{CopyDone: true, TimelineSwitch: &timelineSwitchInfo}, nil
+			default:
+				if rc.shouldLog(LogLevelError) {
+					rc.log(LogLevelError, "Unexpected message type on timeline switch data", map[string]interface{}{"type": dataMsgType})
+				}
+			}
+		case *pgproto3.CommandComplete:
+			fmt.Println("Controlled shutdown")
+			return &ReplicationMessage{CopyDone: true}, nil
+		default:
+			if rc.shouldLog(LogLevelError) {
+				rc.log(LogLevelError, "Unexpected message type on timeline switch", map[string]interface{}{"type": responceMsgType})
+			}
+		}
 	case *pgproto3.CopyData:
 		msgType := msg.Data[0]
 		rp := 1
-
 		switch msgType {
 		case walData:
 			walStart := binary.BigEndian.Uint64(msg.Data[rp:])
@@ -288,6 +346,7 @@ func (rc *ReplicationConn) readReplicationMessage() (r *ReplicationMessage, err 
 			}
 		}
 	default:
+		fmt.Printf("Unexpected replication message: %s\n", reflect.TypeOf(msg))
 		if rc.shouldLog(LogLevelError) {
 			rc.log(LogLevelError, "Unexpected replication message type", map[string]interface{}{"type": msg})
 		}
@@ -457,11 +516,15 @@ func (rc *ReplicationConn) StartReplication(slotName string, startLsn uint64, ti
 // TODO: check the first message with rc.rxMsg() to make sure that it's CopyBoth
 func (rc *ReplicationConn) StartPhysReplication(slotName string, startLsn uint64, timeline int64) (err error) {
 	queryString := fmt.Sprintf("START_REPLICATION SLOT %s %s", slotName, FormatLSN(startLsn))
+	if timeline >= 0 {
+		queryString += fmt.Sprintf(" TIMELINE %d", timeline)
+	}
 	_, err = rc.Exec(queryString)
 	if err != nil {
 		fmt.Printf("Error to exec Start Replication command: %s", err)
 		return
 	}
+	// TODO: check for copyBoth responce
 	return nil
 }
 
